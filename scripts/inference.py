@@ -131,6 +131,91 @@ def clear_generation_max_length(model) -> None:
         generation_config.max_length = None
 
 
+def build_label_likelihood_scores(
+    model,
+    tokenizer,
+    prompt: str,
+    label_texts: list[str],
+    max_seq_length: int,
+) -> list[float]:
+    prompt_ids = tokenizer(
+        prompt,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_seq_length,
+    )["input_ids"]
+
+    if not prompt_ids:
+        return [float("-inf")] * len(label_texts)
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    if pad_token_id is None:
+        raise ValueError("Tokenizer must provide either pad_token_id or eos_token_id")
+
+    sequences: list[list[int]] = []
+    start_positions: list[int] = []
+    label_lengths: list[int] = []
+
+    for label in label_texts:
+        label_ids = tokenizer(f" {label}", add_special_tokens=False)["input_ids"]
+        if not label_ids:
+            label_ids = tokenizer(label, add_special_tokens=False)["input_ids"]
+
+        full_ids = prompt_ids + label_ids
+        overflow = max(0, len(full_ids) - max_seq_length)
+        if overflow > 0:
+            full_ids = full_ids[overflow:]
+        start_idx = max(1, len(prompt_ids) - overflow)
+
+        sequences.append(full_ids)
+        start_positions.append(start_idx)
+        label_lengths.append(len(label_ids))
+
+    max_len = max(len(seq) for seq in sequences)
+    input_ids = torch.full(
+        (len(sequences), max_len),
+        pad_token_id,
+        dtype=torch.long,
+        device=model.device,
+    )
+    attention_mask = torch.zeros(
+        (len(sequences), max_len),
+        dtype=torch.long,
+        device=model.device,
+    )
+
+    for idx, seq in enumerate(sequences):
+        seq_tensor = torch.tensor(seq, dtype=torch.long, device=model.device)
+        input_ids[idx, : len(seq)] = seq_tensor
+        attention_mask[idx, : len(seq)] = 1
+
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+    shifted_logits = logits[:, :-1, :]
+    shifted_labels = input_ids[:, 1:]
+
+    scores: list[float] = []
+    for idx in range(len(sequences)):
+        start = start_positions[idx] - 1
+        valid_len = int(attention_mask[idx].sum().item()) - 1
+        end = min(start + label_lengths[idx], valid_len)
+
+        if end <= start:
+            scores.append(float("-inf"))
+            continue
+
+        token_logits = shifted_logits[idx, start:end, :]
+        token_targets = shifted_labels[idx, start:end]
+        token_log_probs = torch.log_softmax(token_logits, dim=-1)
+        token_scores = token_log_probs.gather(1, token_targets.unsqueeze(1)).squeeze(1)
+        scores.append(float(token_scores.mean().item()))
+
+    return scores
+
+
 class IntentClassification:
     def __init__(self, model_path: str):
         self.config_path = Path(model_path).resolve()
@@ -163,6 +248,14 @@ class IntentClassification:
         self.do_sample = bool(generation_cfg.get("do_sample", False))
         self.temperature = float(generation_cfg.get("temperature", 0.0))
         self.fuzzy_cutoff = float(postprocess_cfg.get("fuzzy_cutoff", 0.72))
+        unknown_threshold_value = postprocess_cfg.get("unknown_threshold", None)
+        if unknown_threshold_value is None:
+            self.unknown_threshold: float | None = None
+        else:
+            self.unknown_threshold = float(unknown_threshold_value)
+            if not 0.0 <= self.unknown_threshold <= 1.0:
+                raise ValueError("postprocess.unknown_threshold must be between 0.0 and 1.0")
+        self.unknown_label = str(postprocess_cfg.get("unknown_label", "unknown")).strip() or "unknown"
 
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=str(self.checkpoint_dir),
@@ -192,9 +285,30 @@ class IntentClassification:
         if "label2id" not in label_mapping:
             raise KeyError(f"Invalid label mapping format in: {label_mapping_path}")
 
+        self.label_texts = list(label_mapping["label2id"].keys())
+        self.label_to_index = {label: idx for idx, label in enumerate(self.label_texts)}
         self.canonical_labels = {
-            normalize_label(label): label for label in label_mapping["label2id"].keys()
+            normalize_label(label): label for label in self.label_texts
         }
+
+    def _label_confidence(self, prompt: str, predicted_label: str) -> float:
+        if predicted_label not in self.label_to_index:
+            return 0.0
+
+        scores = build_label_likelihood_scores(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            label_texts=self.label_texts,
+            max_seq_length=self.max_seq_length,
+        )
+
+        score_tensor = torch.tensor(scores, dtype=torch.float32, device=self.model.device)
+        if not torch.isfinite(score_tensor).any():
+            return 0.0
+
+        probs = torch.softmax(score_tensor, dim=0)
+        return float(probs[self.label_to_index[predicted_label]].item())
 
     def __call__(self, message: str) -> str:
         if not isinstance(message, str) or not message.strip():
@@ -221,11 +335,19 @@ class IntentClassification:
         decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         generated = decoded[len(prompt) :].strip() if decoded.startswith(prompt) else decoded.strip()
 
-        return canonicalize_prediction(
+        predicted_label = canonicalize_prediction(
             prediction=generated,
             canonical_labels=self.canonical_labels,
             fuzzy_cutoff=self.fuzzy_cutoff,
         )
+
+        if self.unknown_threshold is None:
+            return predicted_label
+
+        confidence = self._label_confidence(prompt, predicted_label)
+        if confidence < self.unknown_threshold:
+            return self.unknown_label
+        return predicted_label
 
 
 def main() -> None:

@@ -157,38 +157,7 @@ python scripts/inference.py
 
 Then type a message in terminal. The script returns exactly one label.
 
-## 8. Troubleshooting (Windows + GPU)
-
-### Error 1: `NotImplementedError: Unsloth cannot find any torch accelerator`
-
-Cause:
-
-1. CPU-only torch is installed (`torch+cpu`) instead of CUDA torch (`torch+cuXXX`).
-
-Fix:
-
-1. Reinstall CUDA torch as shown in section 4.3.
-2. Confirm `torch.cuda.is_available()` is `True`.
-
-### Error 2: `include file 'tccdefs.h' not found` during inference/training on Windows
-
-Common cause:
-
-1. Triton TinyCC compiles kernels through Unicode/UNC paths.
-2. Project path contains non-ASCII characters.
-
-Recommended fixes:
-
-1. Move the project to an ASCII-only path, for example `C:\NLP-INDUSTRY-Lab2`.
-2. Use Visual Studio Build Tools (MSVC) to reduce TinyCC issues on Windows.
-3. If you recreate `venv`, re-check the full GPU stack.
-
-Note:
-
-1. The current local environment was patched to bypass TinyCC path issues.
-2. Any local patch inside `venv` can be lost after recreating the environment.
-
-## 9. Config Quick Guide
+## 8. Config Quick Guide
 
 `configs/train.yaml`:
 
@@ -200,7 +169,7 @@ Note:
 1. Set `checkpoint_dir` to your trained output.
 2. Tune generation and postprocessing (`fuzzy_cutoff`).
 
-## 10. Quick Commands (Copy/Paste)
+## 9. Quick Commands (Copy/Paste)
 
 ```powershell
 # 1) Activate environment
@@ -216,3 +185,9 @@ python scripts/train.py --config configs/train.yaml
 # 4) Inference
 python scripts/inference.py --config configs/inference.yaml --message "Where is my refund?"
 ```
+
+## 10. Demo Video
+
+You can watch the demo video here:
+
+https://drive.google.com/file/d/1NrkN3Z5l_uIWd3T_vH2N4sCTU8OiLoEK/view?usp=sharing

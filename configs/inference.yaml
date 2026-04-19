@@ -12,6 +12,8 @@ generation:
 
 postprocess:
   fuzzy_cutoff: 0.72
+  unknown_threshold: 0.05
+  unknown_label: unknown
 
 prompt:
   system: You are a banking intent classifier. Return exactly one BANKING77 label and nothing else.
