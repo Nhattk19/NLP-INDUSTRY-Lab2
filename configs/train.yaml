@@ -1,40 +1,23 @@
-paths:
+seed: 42
+
+data:
   train_csv: sample_data/train.csv
   val_csv: sample_data/val.csv
   test_csv: sample_data/test.csv
-  output_dir: outputs/banking_intent_unsloth
-  checkpoint_dir: banking_intent_lora_model
-  metadata_file: banking_intent_lora_model/metadata.json
-  metrics_file: banking_intent_lora_model/test_metrics.json
-
-data:
   text_column: text
   label_column: category
 
-prompt:
-  train_template: |-
-    Classify the following banking customer message into exactly one intent label.
-    Return only the label and nothing else.
-
-    Message: {message}
-    Intent: {label}
-  inference_template: |-
-    Classify the following banking customer message into exactly one intent label.
-    Return only the label and nothing else.
-
-    Message: {message}
-    Intent:
-  label_chunk_size: 16
-  packing: false
-
 model:
-  name: unsloth/llama-3-8b-bnb-4bit
-  max_seq_length: 128
+  base_model: unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit
+  max_seq_length: 256
   load_in_4bit: true
-  dtype: auto
-
-lora:
-  r: 16
+  lora_r: 16
+  lora_alpha: 16
+  lora_dropout: 0.0
+  bias: none
+  use_gradient_checkpointing: unsloth
+  use_rslora: false
+  packing: false
   target_modules:
     - q_proj
     - k_proj
@@ -43,37 +26,30 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
-  lora_alpha: 16
-  lora_dropout: 0.0
-  bias: none
-  use_gradient_checkpointing: unsloth
-  random_state: 3407
-  use_rslora: false
-  loftq_config: null
 
 training:
-  per_device_train_batch_size: 2
-  per_device_eval_batch_size: 16
+  output_dir: outputs/intent_qwen05b
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
   gradient_accumulation_steps: 4
-  warmup_steps: 5
-  max_steps: 60
-  num_train_epochs: 1
-  learning_rate: 2.0e-4
+  learning_rate: 0.0002
+  num_train_epochs: 2
+  warmup_ratio: 0.03
   weight_decay: 0.01
+  logging_steps: 20
+  evaluation_strategy: epoch
+  save_strategy: epoch
+  optim: adamw_8bit
   lr_scheduler_type: linear
-  optimizer: adamw_8bit
-  logging_steps: 1
-  evaluation_strategy: steps
-  save_strategy: steps
-  save_steps: 10
-  eval_steps: 10
-  save_total_limit: 2
-  fp16: auto
-  bf16: auto
-  load_best_model_at_end: true
-  metric_for_best_model: eval_loss
-  greater_is_better: false
+  max_grad_norm: 1.0
   report_to: none
-  seed: 3407
-  dataset_num_proc: 1
-  packing: false
+
+evaluation:
+  enabled: true
+  max_new_tokens: 12
+  max_samples: 500
+
+prompt:
+  system: You are a banking intent classifier. Return exactly one BANKING77 label and nothing else.
+  input_prefix: "Message:"
+  output_prefix: "Label:"

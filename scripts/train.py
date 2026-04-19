@@ -1,382 +1,410 @@
 from __future__ import annotations
 
+import argparse
+import difflib
+import inspect
 import json
-import sys
+import random
+import re
+import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import torch
 import yaml
 from datasets import Dataset
-from sklearn.metrics import accuracy_score, classification_report
-from transformers import TrainingArguments
-from trl import SFTTrainer
-from unsloth import FastLanguageModel
+from sklearn.metrics import accuracy_score
+from tqdm import tqdm
+from unsloth import FastLanguageModel, is_bfloat16_supported
+from trl import SFTConfig, SFTTrainer
 
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+def suppress_known_warnings() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The attention mask API under `transformers\.modeling_attn_mask_utils`.*",
+        category=FutureWarning,
+    )
 
 
-def resolve_path(raw_path: str | Path) -> Path:
-    path = Path(raw_path)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fine-tune BANKING77 intent model with Unsloth")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/train.yaml",
+        help="Path to training config file",
+    )
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_path(project_dir: Path, path_value: str) -> Path:
+    path = Path(path_value)
     if path.is_absolute():
         return path
-    return (PROJECT_DIR / path).resolve()
+    return (project_dir / path).resolve()
 
 
-def load_yaml(path: Path) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def load_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
 
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
 
-def save_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-def clean_dataframe(df: pd.DataFrame, text_col: str, label_col: str) -> pd.DataFrame:
-    cleaned = df.loc[:, [text_col, label_col]].copy()
-    cleaned[text_col] = cleaned[text_col].astype("string").str.strip().str.replace('"', "", regex=False)
-    cleaned[label_col] = cleaned[label_col].astype("string").str.strip().str.replace('"', "", regex=False)
-    cleaned = cleaned.dropna(subset=[text_col, label_col])
-    cleaned = cleaned[(cleaned[text_col] != "") & (cleaned[label_col] != "")]
-    return cleaned.reset_index(drop=True)
-
-
-def load_dataset_csv(path: Path, text_col: str, label_col: str) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing dataset file: {path}")
-
-    df = pd.read_csv(path)
-    required = {text_col, label_col}
-    missing = required - set(df.columns)
+    required_keys = ["data", "model", "training", "evaluation", "prompt"]
+    missing = [key for key in required_keys if key not in config]
     if missing:
-        raise ValueError(f"{path.name} is missing columns: {sorted(missing)}")
+        raise KeyError(f"Missing config sections: {missing}")
 
-    return clean_dataframe(df, text_col, label_col)
-
-
-def resolve_dtype(dtype_name: str | None) -> torch.dtype | None:
-    if dtype_name is None:
-        return None
-
-    value = dtype_name.strip().lower()
-    if value in {"auto", "none", ""}:
-        return None
-    if value in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    if value in {"fp16", "float16", "half"}:
-        return torch.float16
-    if value in {"fp32", "float32"}:
-        return torch.float32
-
-    raise ValueError(f"Unsupported dtype value: {dtype_name}")
+    return config
 
 
-def build_texts(
+def load_split(csv_path: Path, text_col: str, label_col: str) -> pd.DataFrame:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Data file not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    missing = [col for col in (text_col, label_col) if col not in df.columns]
+    if missing:
+        raise ValueError(f"{csv_path.name} is missing columns: {missing}")
+
+    df = df[[text_col, label_col]].copy()
+    df[text_col] = df[text_col].astype(str).str.strip()
+    df[label_col] = df[label_col].astype(str).str.strip()
+    df = df[(df[text_col] != "") & (df[label_col] != "")].reset_index(drop=True)
+    return df
+
+
+def build_prompt(message: str, config: dict[str, Any], label: str | None = None) -> str:
+    system = str(config["prompt"].get("system", "You are an intent classifier."))
+    input_prefix = str(config["prompt"].get("input_prefix", "Message:"))
+    output_prefix = str(config["prompt"].get("output_prefix", "Label:"))
+
+    message = re.sub(r"\s+", " ", message).strip()
+    prompt = f"{system}\n{input_prefix} {message}\n{output_prefix}"
+    if label is not None:
+        return f"{prompt} {label}"
+    return prompt
+
+
+def build_sft_dataset(
     df: pd.DataFrame,
     text_col: str,
     label_col: str,
-    template: str,
-    eos_token: str,
+    config: dict[str, Any],
 ) -> Dataset:
-    def _format_batch(batch: dict[str, list[str]]) -> dict[str, list[str]]:
-        texts: list[str] = []
-        for message, label in zip(batch[text_col], batch[label_col]):
-            texts.append(template.format(message=message, label=label).strip() + eos_token)
-        return {"text": texts}
-
-    dataset = Dataset.from_pandas(df[[text_col, label_col]], preserve_index=False)
-    return dataset.map(_format_batch, batched=True, remove_columns=[text_col, label_col])
+    formatted = [
+        build_prompt(message=row[text_col], config=config, label=row[label_col])
+        for _, row in df.iterrows()
+    ]
+    return Dataset.from_dict({"text": formatted})
 
 
-def score_label_candidates(
+def normalize_label(label: str) -> str:
+    label = label.strip().lower()
+    label = re.sub(r"[\s\-/]+", "_", label)
+    label = re.sub(r"[^a-z0-9_]", "", label)
+    label = re.sub(r"_+", "_", label).strip("_")
+    return label
+
+
+def canonicalize_prediction(prediction: str, canonical_labels: dict[str, str]) -> str:
+    first_line = prediction.strip().splitlines()[0] if prediction.strip() else ""
+    first_line = first_line.strip(" \t\n\r\"'`.,:;!?()[]{}")
+
+    candidates = [first_line]
+    if ":" in first_line:
+        candidates.append(first_line.split(":", 1)[-1].strip())
+    candidates.extend(re.findall(r"[A-Za-z0-9_\-/?]+", first_line))
+
+    for candidate in candidates:
+        normalized = normalize_label(candidate)
+        if not normalized:
+            continue
+
+        if normalized in canonical_labels:
+            return canonical_labels[normalized]
+
+        containment = [
+            key for key in canonical_labels if key in normalized or normalized in key
+        ]
+        if containment:
+            best_key = max(
+                containment,
+                key=lambda key: (difflib.SequenceMatcher(a=normalized, b=key).ratio(), len(key)),
+            )
+            return canonical_labels[best_key]
+
+        close = difflib.get_close_matches(normalized, list(canonical_labels.keys()), n=1, cutoff=0.72)
+        if close:
+            return canonical_labels[close[0]]
+
+    normalized_first = normalize_label(first_line)
+    if normalized_first and canonical_labels:
+        best_key = max(
+            canonical_labels,
+            key=lambda key: difflib.SequenceMatcher(a=normalized_first, b=key).ratio(),
+        )
+        return canonical_labels[best_key]
+
+    if canonical_labels:
+        return next(iter(canonical_labels.values()))
+
+    return first_line
+
+
+def predict_label(
     model,
     tokenizer,
-    prompts: list[str],
-    label_candidates: list[str],
-    label_chunk_size: int,
-    device: torch.device,
-) -> list[str]:
-    if not prompts:
-        return []
+    message: str,
+    config: dict[str, Any],
+    canonical_labels: dict[str, str],
+) -> str:
+    prompt = build_prompt(message=message, config=config, label=None)
 
-    prompt_batch = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-    prompt_batch = {k: v.to(device) for k, v in prompt_batch.items()}
-    prompt_lengths = prompt_batch["attention_mask"].sum(dim=1).tolist()
-    prompt_rows = [
-        prompt_batch["input_ids"][i, : prompt_lengths[i]].tolist()
-        for i in range(len(prompts))
-    ]
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=int(config["model"].get("max_seq_length", 256)),
+    ).to(model.device)
 
-    eos_id = tokenizer.eos_token_id
-    if eos_id is None:
-        raise ValueError("Tokenizer is missing eos_token_id.")
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=int(config["evaluation"].get("max_new_tokens", 16)),
+            do_sample=False,
+            temperature=0.0,
+            pad_token_id=tokenizer.eos_token_id,
+        )
 
-    label_token_rows = [
-        tokenizer(label, add_special_tokens=False)["input_ids"] + [eos_id]
-        for label in label_candidates
-    ]
-    scores = torch.empty((len(prompts), len(label_candidates)), device=device)
-
-    for label_start in range(0, len(label_candidates), label_chunk_size):
-        chunk_labels = label_token_rows[label_start : label_start + label_chunk_size]
-        sequences: list[dict[str, list[int]]] = []
-        seq_prompt_lengths: list[int] = []
-        seq_lengths: list[int] = []
-
-        for prompt_tokens, prompt_len in zip(prompt_rows, prompt_lengths):
-            for label_tokens in chunk_labels:
-                seq = prompt_tokens + label_tokens
-                sequences.append({"input_ids": seq})
-                seq_prompt_lengths.append(prompt_len)
-                seq_lengths.append(len(seq))
-
-        batch = tokenizer.pad(sequences, padding=True, return_tensors="pt")
-        batch = {k: v.to(device) for k, v in batch.items()}
-
-        with torch.inference_mode():
-            logits = model(**batch).logits
-            log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)
-            target_ids = batch["input_ids"][:, 1:].unsqueeze(-1)
-            token_scores = log_probs.gather(-1, target_ids).squeeze(-1)
-
-            mask = torch.zeros_like(token_scores, dtype=torch.bool)
-            for row, (prompt_len, seq_len) in enumerate(zip(seq_prompt_lengths, seq_lengths)):
-                mask[row, prompt_len - 1 : seq_len - 1] = True
-
-            seq_scores = (token_scores * mask).sum(dim=1)
-
-        scores[:, label_start : label_start + len(chunk_labels)] = seq_scores.view(len(prompts), -1)
-
-    best_indices = scores.argmax(dim=1).tolist()
-    return [label_candidates[idx] for idx in best_indices]
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    generated = decoded[len(prompt) :].strip() if decoded.startswith(prompt) else decoded.strip()
+    return canonicalize_prediction(generated, canonical_labels)
 
 
-def evaluate_csv(
+def clear_generation_max_length(model) -> None:
+    # Keep only max_new_tokens control to avoid noisy max_length precedence warnings.
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is not None and getattr(generation_config, "max_length", None) is not None:
+        generation_config.max_length = None
+
+
+def evaluate(
     model,
     tokenizer,
-    df: pd.DataFrame,
+    test_df: pd.DataFrame,
     text_col: str,
     label_col: str,
-    inference_template: str,
-    label_candidates: list[str],
-    batch_size: int,
-    label_chunk_size: int,
-    device: torch.device,
-) -> dict[str, Any]:
-    messages = df[text_col].tolist()
-    true_labels = df[label_col].tolist()
-    predicted_labels: list[str] = []
+    config: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    max_samples = int(config["evaluation"].get("max_samples", -1))
+    eval_df = test_df if max_samples <= 0 else test_df.head(max_samples).copy()
 
-    for start in range(0, len(messages), batch_size):
-        batch_messages = messages[start : start + batch_size]
-        prompts = [inference_template.format(message=message, label="").strip() for message in batch_messages]
-        batch_predictions = score_label_candidates(
+    labels = sorted(test_df[label_col].unique().tolist())
+    canonical = {normalize_label(label): label for label in labels}
+
+    y_true: list[str] = []
+    y_pred: list[str] = []
+
+    for _, row in tqdm(eval_df.iterrows(), total=len(eval_df), desc="Evaluating"):
+        true_label = row[label_col]
+        pred_label = predict_label(
             model=model,
             tokenizer=tokenizer,
-            prompts=prompts,
-            label_candidates=label_candidates,
-            label_chunk_size=label_chunk_size,
-            device=device,
+            message=row[text_col],
+            config=config,
+            canonical_labels=canonical,
         )
-        predicted_labels.extend(batch_predictions)
+        y_true.append(true_label)
+        y_pred.append(pred_label)
 
-    accuracy = accuracy_score(true_labels, predicted_labels)
-    report = classification_report(true_labels, predicted_labels, zero_division=0)
-
-    return {
-        "accuracy": accuracy,
-        "classification_report": report,
-        "num_examples": len(df),
+    accuracy = accuracy_score(y_true, y_pred)
+    metrics = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "num_eval_samples": len(eval_df),
+        "accuracy": float(accuracy),
     }
+
+    metrics_path = output_dir / "test_metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+    print(f"Test accuracy: {accuracy:.4f}")
+    print(f"Saved test metrics to: {metrics_path}")
 
 
 def main() -> None:
-    config_path = resolve_path(sys.argv[1]) if len(sys.argv) > 1 else resolve_path("configs/train.yaml")
-    config = load_yaml(config_path)
+    suppress_known_warnings()
+    args = parse_args()
 
-    paths_cfg = config["paths"]
-    data_cfg = config["data"]
-    prompt_cfg = config["prompt"]
-    model_cfg = config["model"]
-    lora_cfg = config["lora"]
-    training_cfg = config["training"]
+    script_dir = Path(__file__).resolve().parent
+    project_dir = script_dir.parent
+    config_path = resolve_path(project_dir, args.config)
+    config = load_config(config_path)
 
-    train_path = resolve_path(paths_cfg["train_csv"])
-    val_path = resolve_path(paths_cfg["val_csv"])
-    test_path = resolve_path(paths_cfg["test_csv"])
-    output_dir = resolve_path(paths_cfg["output_dir"])
-    checkpoint_dir = resolve_path(paths_cfg["checkpoint_dir"])
-    metadata_path = resolve_path(paths_cfg["metadata_file"])
-    metrics_path = resolve_path(paths_cfg["metrics_file"])
-
-    text_col = data_cfg["text_column"]
-    label_col = data_cfg["label_column"]
-
-    train_df = load_dataset_csv(train_path, text_col, label_col)
-    if val_path.exists():
-        val_df = load_dataset_csv(val_path, text_col, label_col)
-    else:
-        val_df = pd.DataFrame(columns=[text_col, label_col])
-    test_df = load_dataset_csv(test_path, text_col, label_col)
-
-    label_candidates = sorted(train_df[label_col].astype(str).unique().tolist())
-
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+    seed = int(config.get("seed", 42))
+    set_seed(seed)
 
     if not torch.cuda.is_available():
-        raise RuntimeError("This training script requires a CUDA-capable GPU for Unsloth.")
+        raise RuntimeError("CUDA GPU is required for Unsloth fine-tuning. Use Colab/Kaggle/local GPU.")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    data_cfg = config["data"]
+    text_col = str(data_cfg.get("text_column", "text"))
+    label_col = str(data_cfg.get("label_column", "category"))
 
-    dtype = resolve_dtype(model_cfg.get("dtype"))
-    load_in_4bit = bool(model_cfg.get("load_in_4bit", True))
-    max_seq_length = int(model_cfg["max_seq_length"])
+    train_df = load_split(resolve_path(project_dir, data_cfg["train_csv"]), text_col, label_col)
+    val_df = load_split(resolve_path(project_dir, data_cfg["val_csv"]), text_col, label_col)
+    test_df = load_split(resolve_path(project_dir, data_cfg["test_csv"]), text_col, label_col)
+
+    label_list = sorted(set(train_df[label_col]) | set(val_df[label_col]) | set(test_df[label_col]))
+
+    train_dataset = build_sft_dataset(train_df, text_col, label_col, config)
+    val_dataset = build_sft_dataset(val_df, text_col, label_col, config)
+
+    model_cfg = config["model"]
+    training_cfg = config["training"]
+
+    max_seq_length = int(model_cfg.get("max_seq_length", 256))
 
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_cfg["name"],
+        model_name=str(model_cfg["base_model"]),
         max_seq_length=max_seq_length,
-        dtype=dtype,
-        load_in_4bit=load_in_4bit,
+        dtype=None,
+        load_in_4bit=bool(model_cfg.get("load_in_4bit", True)),
     )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
 
     model = FastLanguageModel.get_peft_model(
         model,
-        r=int(lora_cfg["r"]),
-        target_modules=list(lora_cfg["target_modules"]),
-        lora_alpha=int(lora_cfg["lora_alpha"]),
-        lora_dropout=float(lora_cfg["lora_dropout"]),
-        bias=str(lora_cfg["bias"]),
-        use_gradient_checkpointing=lora_cfg["use_gradient_checkpointing"],
-        random_state=int(lora_cfg["random_state"]),
-        use_rslora=bool(lora_cfg["use_rslora"]),
-        loftq_config=lora_cfg.get("loftq_config"),
+        r=int(model_cfg.get("lora_r", 16)),
+        target_modules=list(model_cfg.get("target_modules", [])),
+        lora_alpha=int(model_cfg.get("lora_alpha", 16)),
+        lora_dropout=float(model_cfg.get("lora_dropout", 0.0)),
+        bias=str(model_cfg.get("bias", "none")),
+        use_gradient_checkpointing=model_cfg.get("use_gradient_checkpointing", "unsloth"),
+        random_state=seed,
+        use_rslora=bool(model_cfg.get("use_rslora", False)),
+        loftq_config=None,
     )
 
-    eos_token = tokenizer.eos_token or ""
-    train_dataset = build_texts(
-        df=train_df,
-        text_col=text_col,
-        label_col=label_col,
-        template=prompt_cfg["train_template"],
-        eos_token=eos_token,
-    )
-    eval_dataset = build_texts(
-        df=val_df if len(val_df) else test_df,
-        text_col=text_col,
-        label_col=label_col,
-        template=prompt_cfg["train_template"],
-        eos_token=eos_token,
-    )
+    output_dir = resolve_path(project_dir, training_cfg["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    fp16_cfg = training_cfg.get("fp16", "auto")
-    bf16_cfg = training_cfg.get("bf16", "auto")
-    use_bf16 = torch.cuda.is_bf16_supported() if str(bf16_cfg).lower() == "auto" else bool(bf16_cfg)
-    use_fp16 = (not use_bf16) if str(fp16_cfg).lower() == "auto" else bool(fp16_cfg)
-
-    training_kwargs: dict[str, Any] = {
+    eval_strategy = str(
+        training_cfg.get("eval_strategy", training_cfg.get("evaluation_strategy", "epoch"))
+    )
+    training_kwargs = {
         "output_dir": str(output_dir),
-        "per_device_train_batch_size": int(training_cfg["per_device_train_batch_size"]),
-        "per_device_eval_batch_size": int(training_cfg["per_device_eval_batch_size"]),
-        "gradient_accumulation_steps": int(training_cfg["gradient_accumulation_steps"]),
-        "warmup_steps": int(training_cfg["warmup_steps"]),
-        "learning_rate": float(training_cfg["learning_rate"]),
-        "weight_decay": float(training_cfg["weight_decay"]),
-        "lr_scheduler_type": str(training_cfg["lr_scheduler_type"]),
-        "optim": str(training_cfg["optimizer"]),
-        "logging_steps": int(training_cfg["logging_steps"]),
-        "evaluation_strategy": str(training_cfg["evaluation_strategy"]),
-        "save_strategy": str(training_cfg["save_strategy"]),
-        "save_steps": int(training_cfg["save_steps"]),
-        "eval_steps": int(training_cfg["eval_steps"]),
-        "save_total_limit": int(training_cfg["save_total_limit"]),
-        "load_best_model_at_end": bool(training_cfg["load_best_model_at_end"]),
-        "metric_for_best_model": str(training_cfg["metric_for_best_model"]),
-        "greater_is_better": bool(training_cfg["greater_is_better"]),
-        "report_to": training_cfg.get("report_to", "none"),
-        "seed": int(training_cfg["seed"]),
-        "fp16": use_fp16,
-        "bf16": use_bf16,
+        "per_device_train_batch_size": int(training_cfg.get("per_device_train_batch_size", 8)),
+        "per_device_eval_batch_size": int(training_cfg.get("per_device_eval_batch_size", 8)),
+        "gradient_accumulation_steps": int(training_cfg.get("gradient_accumulation_steps", 4)),
+        "learning_rate": float(training_cfg.get("learning_rate", 2e-4)),
+        "num_train_epochs": float(training_cfg.get("num_train_epochs", 2)),
+        "warmup_ratio": float(training_cfg.get("warmup_ratio", 0.03)),
+        "weight_decay": float(training_cfg.get("weight_decay", 0.01)),
+        "logging_steps": int(training_cfg.get("logging_steps", 20)),
+        "save_strategy": str(training_cfg.get("save_strategy", "epoch")),
+        "optim": str(training_cfg.get("optim", "adamw_8bit")),
+        "lr_scheduler_type": str(training_cfg.get("lr_scheduler_type", "linear")),
+        "max_grad_norm": float(training_cfg.get("max_grad_norm", 1.0)),
+        "fp16": not is_bfloat16_supported(),
+        "bf16": is_bfloat16_supported(),
+        "report_to": str(training_cfg.get("report_to", "none")),
+        "seed": seed,
     }
 
-    max_steps = int(training_cfg.get("max_steps", -1))
-    if max_steps > 0:
-        training_kwargs["max_steps"] = max_steps
+    training_arg_params = inspect.signature(SFTConfig.__init__).parameters
+    if "eval_strategy" in training_arg_params:
+        training_kwargs["eval_strategy"] = eval_strategy
     else:
-        training_kwargs["num_train_epochs"] = float(training_cfg.get("num_train_epochs", 1.0))
+        training_kwargs["evaluation_strategy"] = eval_strategy
 
-    training_args = TrainingArguments(**training_kwargs)
+    if "dataset_text_field" in training_arg_params:
+        training_kwargs["dataset_text_field"] = "text"
+    if "max_length" in training_arg_params:
+        training_kwargs["max_length"] = max_seq_length
+    elif "max_seq_length" in training_arg_params:
+        training_kwargs["max_seq_length"] = max_seq_length
+    if "packing" in training_arg_params:
+        training_kwargs["packing"] = bool(model_cfg.get("packing", False))
+
+    training_args = SFTConfig(**training_kwargs)
+
+    trainer_kwargs = {
+        "model": model,
+        "train_dataset": train_dataset,
+        "eval_dataset": val_dataset,
+        "args": training_args,
+    }
+
+    trainer_params = inspect.signature(SFTTrainer.__init__).parameters
+    if "processing_class" in trainer_params:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in trainer_params:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    if "dataset_text_field" in trainer_params:
+        trainer_kwargs["dataset_text_field"] = "text"
+    if "max_seq_length" in trainer_params:
+        trainer_kwargs["max_seq_length"] = max_seq_length
+    if "packing" in trainer_params:
+        trainer_kwargs["packing"] = bool(model_cfg.get("packing", False))
 
     trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        dataset_text_field="text",
-        max_seq_length=max_seq_length,
-        dataset_num_proc=int(training_cfg["dataset_num_proc"]),
-        packing=bool(training_cfg.get("packing", False)),
-        args=training_args,
+        **trainer_kwargs,
     )
 
-    print("Starting training...")
-    train_result = trainer.train()
-    print(train_result)
+    print(f"Train samples: {len(train_df)}")
+    print(f"Validation samples: {len(val_df)}")
+    print(f"Test samples: {len(test_df)}")
+    print(f"Unique labels: {len(label_list)}")
 
-    print("Saving checkpoint...")
-    model.save_pretrained(str(checkpoint_dir))
-    tokenizer.save_pretrained(str(checkpoint_dir))
+    trainer.train()
 
-    metadata = {
-        "model_name": model_cfg["name"],
-        "checkpoint_dir": str(checkpoint_dir),
-        "text_column": text_col,
-        "label_column": label_col,
-        "label_candidates": label_candidates,
-        "train_template": prompt_cfg["train_template"],
-        "inference_template": prompt_cfg["inference_template"],
-        "max_seq_length": max_seq_length,
-        "load_in_4bit": load_in_4bit,
-        "lora": {
-            "r": int(lora_cfg["r"]),
-            "target_modules": list(lora_cfg["target_modules"]),
-            "lora_alpha": int(lora_cfg["lora_alpha"]),
-            "lora_dropout": float(lora_cfg["lora_dropout"]),
-            "bias": str(lora_cfg["bias"]),
-        },
+    trainer.save_model(str(output_dir))
+    tokenizer.save_pretrained(str(output_dir))
+
+    label_mapping = {
+        "label2id": {label: idx for idx, label in enumerate(label_list)},
+        "id2label": {str(idx): label for idx, label in enumerate(label_list)},
     }
-    save_json(metadata_path, metadata)
 
-    FastLanguageModel.for_inference(model)
-    test_metrics = evaluate_csv(
-        model=model,
-        tokenizer=tokenizer,
-        df=test_df,
-        text_col=text_col,
-        label_col=label_col,
-        inference_template=prompt_cfg["inference_template"],
-        label_candidates=label_candidates,
-        batch_size=int(training_cfg["per_device_eval_batch_size"]),
-        label_chunk_size=int(prompt_cfg["label_chunk_size"]),
-        device=torch.device("cuda"),
-    )
-    save_json(metrics_path, test_metrics)
+    with open(output_dir / "label_mapping.json", "w", encoding="utf-8") as f:
+        json.dump(label_mapping, f, indent=2, ensure_ascii=False)
 
-    print("\nTest accuracy:", f"{test_metrics['accuracy'] * 100:.2f}%")
-    print("\nClassification report:")
-    print(test_metrics["classification_report"])
-    print(f"\nCheckpoint saved to: {checkpoint_dir}")
-    print(f"Metadata saved to: {metadata_path}")
-    print(f"Test metrics saved to: {metrics_path}")
+    with open(output_dir / "train_config_snapshot.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, sort_keys=False, allow_unicode=False)
+
+    if bool(config["evaluation"].get("enabled", True)):
+        FastLanguageModel.for_inference(model)
+        clear_generation_max_length(model)
+        evaluate(
+            model=model,
+            tokenizer=tokenizer,
+            test_df=test_df,
+            text_col=text_col,
+            label_col=label_col,
+            config=config,
+            output_dir=output_dir,
+        )
+
+    print(f"Saved checkpoint and artifacts to: {output_dir}")
 
 
 if __name__ == "__main__":

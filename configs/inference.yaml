@@ -1,0 +1,19 @@
+model:
+  checkpoint_dir: outputs/intent_qwen05b
+  label_mapping_path: outputs/intent_qwen05b/label_mapping.json
+  train_config_snapshot: outputs/intent_qwen05b/train_config_snapshot.yaml
+  max_seq_length: 256
+  load_in_4bit: true
+
+generation:
+  max_new_tokens: 12
+  do_sample: false
+  temperature: 0.0
+
+postprocess:
+  fuzzy_cutoff: 0.72
+
+prompt:
+  system: You are a banking intent classifier. Return exactly one BANKING77 label and nothing else.
+  input_prefix: "Message:"
+  output_prefix: "Label:"
