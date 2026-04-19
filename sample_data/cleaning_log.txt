@@ -1,0 +1,29 @@
+Preprocessing summary
+Source train rows: 10003
+Source test rows: 3080
+Combined rows: 13083
+Removed empty rows: 0
+Removed invalid category rows: 0
+Removed duplicate rows: 11
+Final rows: 13072
+
+Split sizes
+Train: 10457
+Val: 1307
+Test: 1308
+
+Invalid category rows
+None
+
+Duplicate rows
+1. text="I can't seem to be able to use my card" | category='card_not_working'
+2. text='I put the wrong pin too many times and now it is blocked. Can you help me unblock it?' | category='pin_blocked'
+3. text='Where can I withdraw money from?' | category='atm_support'
+4. text='Do I need to go to a physical bank to change my PIN?' | category='change_pin'
+5. text='How do I unblock my PIN?' | category='pin_blocked'
+6. text='What businesses accept this card?' | category='card_acceptance'
+7. text='Where can I use my card?' | category='card_acceptance'
+8. text="There are a few transaction that I don't recognize, I think someone managed to get my card details and use it." | category='compromised_card'
+9. text='Which ATMs accept this card?' | category='atm_support'
+10. text='At which ATMs can I use this card?' | category='atm_support'
+11. text='Which cash machines will allow me to change my PIN?' | category='change_pin'

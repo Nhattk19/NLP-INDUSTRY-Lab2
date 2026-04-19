@@ -1,0 +1,17 @@
+unsloth
+transformers
+trl
+accelerate
+datasets
+torch
+peft
+bitsandbytes
+scikit-learn
+pandas
+numpy
+pyyaml
+tqdm
+matplotlib
+seaborn
+sentencepiece
+protobuf
