@@ -202,6 +202,12 @@ def clear_generation_max_length(model) -> None:
         generation_config.max_length = None
 
 
+def remove_unneeded_artifacts(output_dir: Path) -> None:
+    chat_template = output_dir / "chat_template.jinja"
+    if chat_template.exists():
+        chat_template.unlink()
+
+
 def evaluate(
     model,
     tokenizer,
@@ -319,7 +325,7 @@ def main() -> None:
         "warmup_ratio": float(training_cfg.get("warmup_ratio", 0.03)),
         "weight_decay": float(training_cfg.get("weight_decay", 0.01)),
         "logging_steps": int(training_cfg.get("logging_steps", 20)),
-        "save_strategy": str(training_cfg.get("save_strategy", "epoch")),
+        "save_strategy": "no",
         "optim": str(training_cfg.get("optim", "adamw_8bit")),
         "lr_scheduler_type": str(training_cfg.get("lr_scheduler_type", "linear")),
         "max_grad_norm": float(training_cfg.get("max_grad_norm", 1.0)),
@@ -388,9 +394,6 @@ def main() -> None:
     with open(output_dir / "label_mapping.json", "w", encoding="utf-8") as f:
         json.dump(label_mapping, f, indent=2, ensure_ascii=False)
 
-    with open(output_dir / "train_config_snapshot.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f, sort_keys=False, allow_unicode=False)
-
     if bool(config["evaluation"].get("enabled", True)):
         FastLanguageModel.for_inference(model)
         clear_generation_max_length(model)
@@ -403,6 +406,8 @@ def main() -> None:
             config=config,
             output_dir=output_dir,
         )
+
+    remove_unneeded_artifacts(output_dir)
 
     print(f"Saved checkpoint and artifacts to: {output_dir}")
 
