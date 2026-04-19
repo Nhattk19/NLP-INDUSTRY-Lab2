@@ -47,7 +47,7 @@ training:
 evaluation:
   enabled: true
   max_new_tokens: 12
-  max_samples: 500
+  max_samples: -1
 
 prompt:
   system: You are a banking intent classifier. Return exactly one BANKING77 label and nothing else.
